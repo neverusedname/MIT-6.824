@@ -1,5 +1,16 @@
 package raft
 
+import (
+	"6.824/labrpc"
+	crand "crypto/rand"
+	"log"
+	"math/big"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
 //
 // this is an outline of the API that raft must expose to
 // the service (or tester). see comments below for
@@ -16,16 +27,6 @@ package raft
 //   should send an ApplyMsg to the service (or tester)
 //   in the same server.
 //
-
-import (
-//	"bytes"
-	"sync"
-	"sync/atomic"
-
-//	"6.824/labgob"
-	"6.824/labrpc"
-)
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -64,15 +65,31 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	currentTerm int
+	votedFor    int
+
+	rand             *rand.Rand
+	minTimeoutMillis int
+	maxTimeoutMillis int
+	timeoutAtNanos   int64 // unix millis
+
+	role   int32 // 0: follower, 1, candidate, 2 leader
+	quorum int
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	var term int
 	var isleader bool
 	// Your code here (2A).
+
+	term = rf.currentTerm
+	isleader = rf.role == 2
+
 	return term, isleader
 }
 
@@ -91,7 +108,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -115,7 +131,6 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
 //
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
@@ -136,13 +151,14 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term        int
+	CandidateId int
 }
 
 //
@@ -151,6 +167,18 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
+}
+
+type AppendEntriesArgs struct {
+	Term     int
+	LeaderId int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
 }
 
 //
@@ -158,6 +186,40 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm { // candidateTerm < currentTerm, reject
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+
+	if args.Term > rf.currentTerm { // candidate term > currentTerm, grant
+		rf.currentTerm = args.Term
+
+		rf.role = 0
+		rf.votedFor = args.CandidateId
+		rf.resetTimeout()
+
+		reply.VoteGranted = true
+		reply.Term = rf.currentTerm
+
+		return
+	}
+
+	// now the term are equal
+	reply.Term = rf.currentTerm
+	if rf.votedFor < 0 { // haven't voted for no body
+		rf.votedFor = args.CandidateId
+		reply.VoteGranted = true
+	} else if rf.votedFor == args.CandidateId { // this should never happen
+		reply.VoteGranted = true
+	} else {
+		reply.VoteGranted = false
+	}
+
 }
 
 //
@@ -194,7 +256,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -215,7 +276,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -244,13 +304,156 @@ func (rf *Raft) killed() bool {
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
+	log.Println(rf.me, " start ticker.")
+	rf.mu.Lock()
+	rf.resetTimeout()
+	rf.mu.Unlock()
+
 	for rf.killed() == false {
+		rf.mu.Lock()
+		span := rf.timeoutAtNanos - time.Now().UnixNano()
+		rf.mu.Unlock()
 
-		// Your code here to check if a leader election should
-		// be started and to randomize sleeping time using
-		// time.Sleep().
+		if span > 0 {
+			// Your code here to check if a leader election should
+			// be started and to randomize sleeping time using
+			time.Sleep(time.Nanosecond * time.Duration(span))
+		}
 
+		rf.mu.Lock()
+		shouldTimeout := time.Now().UnixNano() > rf.timeoutAtNanos
+		rf.mu.Unlock()
+
+		if shouldTimeout {
+			rf.competeForLeader()
+		}
 	}
+}
+
+func (rf *Raft) competeForLeader() {
+	log.Println(rf.me, "timeout, running for leader...")
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.role = 1
+	rf.currentTerm += 1
+	rf.votedFor = rf.me
+	rf.resetTimeout()
+
+	var votes int32 = 1
+	for idx, peer := range rf.peers {
+		if idx == rf.me {
+			continue
+		}
+
+		go func(peer *labrpc.ClientEnd, i int) {
+			req := RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me}
+			reply := RequestVoteReply{}
+
+			for { // retry indefinitely
+				log.Println(rf.me, "sending request vote to", i)
+				ok := peer.Call("Raft.RequestVote", &req, &reply)
+				if ok {
+					if reply.VoteGranted {
+						log.Println(rf.me, "got vote granted from ", i, ".")
+						voteCount := atomic.AddInt32(&votes, 1)
+						if voteCount == int32(rf.quorum) {
+							go rf.takeOver()
+						}
+					}
+					break
+				}
+			}
+		}(peer, idx)
+	}
+}
+
+func (rf *Raft) resetTimeout() {
+	spanMillis := rf.rand.Intn(rf.maxTimeoutMillis-rf.minTimeoutMillis) + rf.minTimeoutMillis
+	rf.timeoutAtNanos = time.Now().UnixNano() + int64(spanMillis*1000000)
+}
+
+func (rf *Raft) takeOver() {
+	log.Println(rf.me, "takes over.")
+	rf.mu.Lock()
+	rf.role = 2
+	rf.mu.Unlock()
+
+	for {
+		role := atomic.LoadInt32(&rf.role)
+		if role != 2 {
+			break
+		}
+
+		rf.mu.Lock()
+		rf.resetTimeout() // reset timeout of myself
+		rf.mu.Unlock()
+
+		// send periodic heartbeats to suppress peer timeouts
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me {
+				continue
+			}
+
+			go func(peer *labrpc.ClientEnd) {
+				args := AppendEntriesArgs{rf.currentTerm, rf.me}
+				reply := AppendEntriesReply{}
+
+				for { // call until got resp
+					ok := peer.Call("Raft.AppendEntries", &args, &reply)
+					if ok {
+						break
+					}
+				}
+
+				if !reply.Success {
+					if reply.Term > rf.currentTerm {
+						rf.mu.Lock()
+						rf.revertToFollower(reply.Term)
+						rf.mu.Unlock()
+					}
+				}
+			}(rf.peers[i])
+		}
+
+		span := time.Duration(float64(rf.minTimeoutMillis) * 0.5)
+		time.Sleep(time.Millisecond * span)
+	}
+}
+
+func (rf *Raft) revertToFollower(term int) {
+	rf.currentTerm = term
+	rf.role = 0
+	rf.resetTimeout()
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	log.Println(rf.me, "got append entries from ", args.LeaderId)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.currentTerm < args.Term {
+		rf.votedFor = -1 // Didn't vote i this term
+		rf.revertToFollower(args.Term)
+		reply.Term = rf.currentTerm
+		reply.Success = true
+		return
+	}
+
+	if rf.currentTerm == args.Term {
+		if rf.me == args.LeaderId { // This should never happen
+			reply.Term = rf.currentTerm
+			reply.Success = true
+		} else { // term equal, and heart beat send not from self
+			rf.revertToFollower(args.Term)
+			reply.Success = true
+			reply.Term = rf.currentTerm
+		}
+	}
+
+	// rf.currentTerm > args.term
+	reply.Term = rf.currentTerm
+	reply.Success = false
 }
 
 //
@@ -266,19 +469,30 @@ func (rf *Raft) ticker() {
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
+
+	log.Default().Println("Making raft, me: ", me)
+
 	rf := &Raft{}
 	rf.peers = peers
+	rf.quorum = len(peers)/2 + 1
+	rf.votedFor = -1
 	rf.persister = persister
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	max := big.NewInt(int64(1) << 62)
+	bigX, _ := crand.Int(crand.Reader, max)
+	seed := bigX.Int64()
+	rf.rand = rand.New(rand.NewSource(seed))
+
+	rf.minTimeoutMillis = 100
+	rf.maxTimeoutMillis = 300
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
 
 	return rf
 }

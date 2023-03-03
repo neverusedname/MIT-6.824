@@ -145,7 +145,7 @@ func MakeNetwork() *Network {
 	rn.servers = map[interface{}]*Server{}
 	rn.connections = map[interface{}](interface{}){}
 	rn.endCh = make(chan reqMsg)
-	rn.done = make(chan struct{})
+	rn.done = make(chan struct{}) // Empty struct channel
 
 	// single goroutine to handle all ClientEnd.Call()s
 	go func() {
@@ -195,8 +195,8 @@ func (rn *Network) readEndnameInfo(endname interface{}) (enabled bool,
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
-	enabled = rn.enabled[endname]
-	servername = rn.connections[endname]
+	enabled = rn.enabled[endname] // whether endname is enabled
+	servername = rn.connections[endname] // endname -> servername
 	if servername != nil {
 		server = rn.servers[servername]
 	}
