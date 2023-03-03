@@ -186,18 +186,22 @@ type AppendEntriesReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	log.Println(rf.me, "got request vote from", args.CandidateId, ", candidate term: ", args.Term)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm { // candidateTerm < currentTerm, reject
+		log.Println(rf.me, "rejected request vote from", args.CandidateId)
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
 	}
 
 	if args.Term > rf.currentTerm { // candidate term > currentTerm, grant
+		log.Println(rf.me, "granted request vote from", args.CandidateId)
 		rf.currentTerm = args.Term
+
+		// there should be a process of immediately revert to follower state, simple skip
 
 		rf.role = 0
 		rf.votedFor = args.CandidateId
@@ -214,9 +218,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.votedFor < 0 { // haven't voted for no body
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
+		log.Println(rf.me, "granted request vote from", args.CandidateId)
 	} else if rf.votedFor == args.CandidateId { // this should never happen
 		reply.VoteGranted = true
 	} else {
+		log.Println(rf.me, "rejected req vote from", args.CandidateId, ", co's it has voted for", rf.votedFor)
 		reply.VoteGranted = false
 	}
 
@@ -335,14 +341,16 @@ func (rf *Raft) competeForLeader() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// vote for myself
 	rf.role = 1
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
 	rf.resetTimeout()
 
 	var votes int32 = 1
+
 	for idx, peer := range rf.peers {
-		if idx == rf.me {
+		if idx == rf.me { // skip myself
 			continue
 		}
 
@@ -350,20 +358,19 @@ func (rf *Raft) competeForLeader() {
 			req := RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me}
 			reply := RequestVoteReply{}
 
-			for { // retry indefinitely
-				log.Println(rf.me, "sending request vote to", i)
-				ok := peer.Call("Raft.RequestVote", &req, &reply)
-				if ok {
-					if reply.VoteGranted {
-						log.Println(rf.me, "got vote granted from ", i, ".")
-						voteCount := atomic.AddInt32(&votes, 1)
-						if voteCount == int32(rf.quorum) {
-							go rf.takeOver()
-						}
-					}
-					break
+			log.Println(rf.me, "sending request vote to", i)
+			ok := peer.Call("Raft.RequestVote", &req, &reply)
+
+			if ok && reply.VoteGranted {
+				log.Println(rf.me, "got vote granted from ", i, ".")
+				voteCount := atomic.AddInt32(&votes, 1)
+
+				if voteCount == int32(rf.quorum) {
+					go rf.takeOver()
 				}
+
 			}
+
 		}(peer, idx)
 	}
 }
@@ -379,14 +386,10 @@ func (rf *Raft) takeOver() {
 	rf.role = 2
 	rf.mu.Unlock()
 
-	for {
-		role := atomic.LoadInt32(&rf.role)
-		if role != 2 {
-			break
-		}
+	for atomic.LoadInt32(&rf.role) == 2 { // as long as I am master
 
 		rf.mu.Lock()
-		rf.resetTimeout() // reset timeout of myself
+		rf.resetTimeout() // reset timeout of myself, send append entries to myself
 		rf.mu.Unlock()
 
 		// send periodic heartbeats to suppress peer timeouts
@@ -399,24 +402,19 @@ func (rf *Raft) takeOver() {
 				args := AppendEntriesArgs{rf.currentTerm, rf.me}
 				reply := AppendEntriesReply{}
 
-				for { // call until got resp
-					ok := peer.Call("Raft.AppendEntries", &args, &reply)
-					if ok {
-						break
-					}
+				peer.Call("Raft.AppendEntries", &args, &reply)
+
+				if !reply.Success && reply.Term > rf.currentTerm {
+					// immediately reverts to follower
+					rf.mu.Lock()
+					rf.revertToFollower(reply.Term)
+					rf.mu.Unlock()
 				}
 
-				if !reply.Success {
-					if reply.Term > rf.currentTerm {
-						rf.mu.Lock()
-						rf.revertToFollower(reply.Term)
-						rf.mu.Unlock()
-					}
-				}
 			}(rf.peers[i])
 		}
 
-		span := time.Duration(float64(rf.minTimeoutMillis) * 0.5)
+		span := time.Duration(float64(rf.minTimeoutMillis) * 0.75)
 		time.Sleep(time.Millisecond * span)
 	}
 }
