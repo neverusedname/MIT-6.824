@@ -293,12 +293,62 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
 	if rf.role != 2 { // not leader
 		return index, term, isLeader
 	}
 
 	// Your code here (2B).
+	nextIdx := rf.nexIndex[rf.me]
+	entry := []interface{}{nextIdx, rf.currentTerm, command}
+	rf.log = append(rf.log, entry)
+
+	rf.nexIndex[rf.me]++
+	rf.matchIndex[rf.me]++
+	var acks int32 = 1
+
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me { // don't send to myself
+			continue
+		}
+
+		go func(serverIdx int) {
+			args := &AppendEntriesArgs{}
+			reply := &AppendEntriesReply{}
+
+			for {
+				ok := rf.peers[serverIdx].Call("Raft.AppendEntries", args, reply)
+				if !ok {
+					continue
+				}
+
+				if reply.Success {
+
+					rf.mu.Lock()
+					// TODO: consider sequence, prior message might arrive later
+					rf.matchIndex[serverIdx] = nextIdx
+					rf.nexIndex[serverIdx] = nextIdx + 1
+					n := atomic.AddInt32(&acks, 1)
+
+					if n == int32(rf.quorum) {
+						rf.commitIndex = nextIdx // commit this message
+
+						applyMsg := ApplyMsg{}
+						applyMsg.Command = command
+						applyMsg.CommandIndex = nextIdx
+						applyMsg.CommandValid = true
+
+						// apply to state machine
+						rf.applyCh <- applyMsg
+						rf.lastApplied = nextIdx
+					}
+
+					rf.mu.Unlock()
+				}
+
+				break
+			}
+		}(i)
+	}
 
 	return index, term, isLeader
 }
