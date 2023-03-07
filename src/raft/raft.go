@@ -184,6 +184,12 @@ type RequestVoteReply struct {
 type AppendEntriesArgs struct {
 	Term     int
 	LeaderId int
+
+	PrevLogTerm  int
+	PrevLogIndex int
+	Entries      interface{}
+
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -298,12 +304,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	// Your code here (2B).
-	nextIdx := rf.nexIndex[rf.me]
-	entry := []interface{}{nextIdx, rf.currentTerm, command}
+	logIndex := rf.nexIndex[rf.me]
+	entry := []interface{}{logIndex, rf.currentTerm, command}
 	rf.log = append(rf.log, entry)
 
 	rf.nexIndex[rf.me]++
-	rf.matchIndex[rf.me]++
+	rf.matchIndex[rf.me] = logIndex
+
 	var acks int32 = 1
 
 	for i := 0; i < len(rf.peers); i++ {
@@ -313,6 +320,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 		go func(serverIdx int) {
 			args := &AppendEntriesArgs{}
+			args.Term = rf.currentTerm
+			args.LeaderId = rf.me
+
+			prevEntry := rf.log[logIndex-1].([]interface{})
+
+			args.PrevLogIndex = prevEntry[0].(int)
+			args.PrevLogTerm = prevEntry[1].(int)
+			args.Entries = []interface{}{entry}
+			args.LeaderCommit = rf.commitIndex
+
 			reply := &AppendEntriesReply{}
 
 			for {
@@ -322,29 +339,41 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				}
 
 				if reply.Success {
-
 					rf.mu.Lock()
-					// TODO: consider sequence, prior message might arrive later
-					rf.matchIndex[serverIdx] = nextIdx
-					rf.nexIndex[serverIdx] = nextIdx + 1
+
+					// earlier messages replies could arrive late
+					if logIndex <= rf.matchIndex[serverIdx] {
+						rf.mu.Unlock()
+						break
+					}
+
+					rf.matchIndex[serverIdx] = logIndex
+					rf.nexIndex[serverIdx] = logIndex + 1
 					n := atomic.AddInt32(&acks, 1)
 
 					if n == int32(rf.quorum) {
-						rf.commitIndex = nextIdx // commit this message
+						rf.commitIndex = logIndex // commit this message
 
 						applyMsg := ApplyMsg{}
 						applyMsg.Command = command
-						applyMsg.CommandIndex = nextIdx
+						applyMsg.CommandIndex = logIndex
 						applyMsg.CommandValid = true
 
 						// apply to state machine
 						rf.applyCh <- applyMsg
-						rf.lastApplied = nextIdx
+						rf.lastApplied = logIndex
 					}
 
 					rf.mu.Unlock()
+				} else if reply.Term <= rf.currentTerm { // append entry failure
+					rf.mu.Lock()
+					rf.nexIndex[serverIdx]-- // decrease next index
+					rf.mu.Unlock()
+				} else {
+					rf.mu.Lock()
+					rf.revertToFollower(reply.Term)
+					rf.mu.Unlock()
 				}
-
 				break
 			}
 		}(i)
@@ -466,7 +495,12 @@ func (rf *Raft) takeOver() {
 			}
 
 			go func(peer *labrpc.ClientEnd) {
-				args := AppendEntriesArgs{rf.currentTerm, rf.me}
+				args := AppendEntriesArgs{}
+
+				args.Term = rf.currentTerm
+				args.LeaderId = rf.me
+				args.LeaderCommit = rf.commitIndex
+
 				reply := AppendEntriesReply{}
 
 				peer.Call("Raft.AppendEntries", &args, &reply)
@@ -497,20 +531,38 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// Election restriction
+	lastCommitEntry := rf.log[rf.commitIndex].([]interface{})
+	lastCommitEntryTerm := lastCommitEntry[1].(int) // initialized to 0
+	if args.Term < lastCommitEntryTerm {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	lastCommitEntryIdx := lastCommitEntry[0].(int) // initialized to 0
+	if args.LeaderCommit < lastCommitEntryIdx {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		return
+	}
+
 	if rf.currentTerm < args.Term {
 		rf.votedFor = -1 // Didn't vote i this term
 		rf.revertToFollower(args.Term)
+
+		// TODO: implement follower append entries entries logic
 		reply.Term = rf.currentTerm
 		reply.Success = true
 		return
 	}
 
 	if rf.currentTerm == args.Term {
-		if rf.me == args.LeaderId { // This should never happen
-			reply.Term = rf.currentTerm
-			reply.Success = true
+		if rf.me == args.LeaderId {
+			// this should never happen
 		} else { // term equal, and heart beat send not from self
 			rf.revertToFollower(args.Term)
+			// TODO: implement follower append entries entries logic
 			reply.Success = true
 			reply.Term = rf.currentTerm
 		}
@@ -549,10 +601,22 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	bigX, _ := crand.Int(crand.Reader, max)
 	seed := bigX.Int64()
 	rf.rand = rand.New(rand.NewSource(seed))
-
 	rf.minTimeoutMillis = 100
 	rf.maxTimeoutMillis = 300
 
+	rf.votedFor = -1
+	rf.currentTerm = 0
+
+	rf.log = make([]interface{}, 0, 256)
+	rf.log = append(rf.log, []interface{}{0, 0, nil}) // put a dummy head
+
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+
+	rf.matchIndex = []int{0, 0, 0}
+	rf.nexIndex = []int{1, 1, 1}
+
+	// log replication related code goes here
 	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
