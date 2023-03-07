@@ -75,6 +75,16 @@ type Raft struct {
 
 	role   int32 // 0: follower, 1, candidate, 2 leader
 	quorum int
+
+	// 2B code goes here
+	log         []interface{}
+	commitIndex int // index of highest log entry known to be committed
+	lastApplied int // index of highest log entry applied to state machine
+
+	nexIndex   []int
+	matchIndex []int
+
+	applyCh chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -281,6 +291,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.role != 2 { // not leader
+		return index, term, isLeader
+	}
+
 	// Your code here (2B).
 
 	return index, term, isLeader
@@ -485,6 +502,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.minTimeoutMillis = 100
 	rf.maxTimeoutMillis = 300
+
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

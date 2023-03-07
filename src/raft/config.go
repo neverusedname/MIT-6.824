@@ -134,17 +134,20 @@ func (cfg *config) crash1(i int) {
 }
 
 func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
+	// bigloser: i is the current server id
 	err_msg := ""
 	v := m.Command
+
+	// all followers got applyCh too
 	for j := 0; j < len(cfg.logs); j++ {
-		if old, oldok := cfg.logs[j][m.CommandIndex]; oldok && old != v {
+		if old, oldok := cfg.logs[j][m.CommandIndex]; oldok && old != v { // log of same index got different command
 			log.Printf("%v: log %v; server %v\n", i, cfg.logs[i], cfg.logs[j])
 			// some server has already committed a different value for this entry!
 			err_msg = fmt.Sprintf("commit index=%v server=%v %v != server=%v %v",
 				m.CommandIndex, i, m.Command, j, old)
 		}
 	}
-	_, prevok := cfg.logs[i][m.CommandIndex-1]
+	_, prevok := cfg.logs[i][m.CommandIndex-1] // if previous log exists?
 	cfg.logs[i][m.CommandIndex] = v
 	if m.CommandIndex > cfg.maxIndex {
 		cfg.maxIndex = m.CommandIndex
@@ -162,6 +165,8 @@ func (cfg *config) applier(i int, applyCh chan ApplyMsg) {
 			cfg.mu.Lock()
 			err_msg, prevok := cfg.checkLogs(i, m)
 			cfg.mu.Unlock()
+
+			// bigloser: applied command index increases monotonously, 1 -> 2 -> 3 -> 4
 			if m.CommandIndex > 1 && prevok == false {
 				err_msg = fmt.Sprintf("server %v apply out of order %v", i, m.CommandIndex)
 			}
@@ -268,15 +273,14 @@ func (cfg *config) start1(i int, applier func(int, chan ApplyMsg)) {
 
 	cfg.mu.Unlock()
 
-	applyCh := make(chan ApplyMsg)
-
+	applyCh := make(chan ApplyMsg) // bigloser: make an apply channel here
 	rf := Make(ends, i, cfg.saved[i], applyCh)
 
 	cfg.mu.Lock()
 	cfg.rafts[i] = rf
 	cfg.mu.Unlock()
 
-	go applier(i, applyCh)
+	go applier(i, applyCh) // start applierChannel consumer
 
 	svc := labrpc.MakeService(rf)
 	srv := labrpc.MakeServer()

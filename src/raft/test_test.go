@@ -126,9 +126,9 @@ func TestBasicAgree2B(t *testing.T) {
 
 	cfg.begin("Test (2B): basic agreement")
 
-	iters := 3
+	iters := 3 // send this many command to raft server
 	for index := 1; index < iters+1; index++ {
-		nd, _ := cfg.nCommitted(index)
+		nd, _ := cfg.nCommitted(index) // how many servers think a log entry is committed
 		if nd > 0 {
 			t.Fatalf("some have committed before Start()")
 		}
