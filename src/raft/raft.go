@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"6.824/labgob"
 	"6.824/labrpc"
 	crand "crypto/rand"
 	"log"
@@ -77,14 +78,18 @@ type Raft struct {
 	quorum int
 
 	// 2B code goes here
-	log         []interface{}
+	log         []LogEntry
 	commitIndex int // index of highest log entry known to be committed
 	lastApplied int // index of highest log entry applied to state machine
+
+	logAck map[int]int // logIndex -> how many acks
 
 	nexIndex   []int
 	matchIndex []int
 
 	applyCh chan ApplyMsg
+
+	broadcastLogChan []chan int
 }
 
 // return currentTerm and whether this server
@@ -169,6 +174,9 @@ type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term        int
 	CandidateId int
+
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -187,7 +195,7 @@ type AppendEntriesArgs struct {
 
 	PrevLogTerm  int
 	PrevLogIndex int
-	Entries      interface{}
+	Entries      []interface{}
 
 	LeaderCommit int
 }
@@ -197,19 +205,37 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
-//
-// example RequestVote RPC handler.
-//
+type LogEntry struct {
+	Term    int
+	Index   int
+	Command interface{}
+}
+
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	log.Println(rf.me, "got request vote from", args.CandidateId, ", candidate term: ", args.Term)
+	log.Printf("%v got request vote from %v, candidate term: %v\n", rf.me, args.CandidateId, args.Term)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	if args.Term < rf.currentTerm { // candidateTerm < currentTerm, reject
-		log.Println(rf.me, "rejected request vote from", args.CandidateId)
+		log.Printf("%v rejected request vote from %v.\n", rf.me, args.CandidateId)
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
+		return
+	}
+
+	// election restriction, compare by term
+	lastEntry := rf.log[len(rf.log)-1] // [index, term, cmd]
+	if args.LastLogTerm < lastEntry.Term {
+		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	// election restriction, compare by log index
+	if args.LastLogIndex < lastEntry.Index {
+		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
 		return
 	}
 
@@ -293,93 +319,36 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	log.Printf("%v got client cmd: %v\n", rf.me, command)
+
 	if rf.role != 2 { // not leader
-		return index, term, isLeader
+		return -1, -1, false
 	}
 
 	// Your code here (2B).
 	logIndex := rf.nexIndex[rf.me]
-	entry := []interface{}{logIndex, rf.currentTerm, command}
+	entry := LogEntry{rf.currentTerm, logIndex, command}
 	rf.log = append(rf.log, entry)
 
+	rf.logAck[logIndex] = 1
 	rf.nexIndex[rf.me]++
-	rf.matchIndex[rf.me] = logIndex
-
-	var acks int32 = 1
 
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me { // don't send to myself
 			continue
 		}
 
-		go func(serverIdx int) {
-			args := &AppendEntriesArgs{}
-			args.Term = rf.currentTerm
-			args.LeaderId = rf.me
-
-			prevEntry := rf.log[logIndex-1].([]interface{})
-
-			args.PrevLogIndex = prevEntry[0].(int)
-			args.PrevLogTerm = prevEntry[1].(int)
-			args.Entries = []interface{}{entry}
-			args.LeaderCommit = rf.commitIndex
-
-			reply := &AppendEntriesReply{}
-
-			for {
-				ok := rf.peers[serverIdx].Call("Raft.AppendEntries", args, reply)
-				if !ok {
-					continue
-				}
-
-				if reply.Success {
-					rf.mu.Lock()
-
-					// earlier messages replies could arrive late
-					if logIndex <= rf.matchIndex[serverIdx] {
-						rf.mu.Unlock()
-						break
-					}
-
-					rf.matchIndex[serverIdx] = logIndex
-					rf.nexIndex[serverIdx] = logIndex + 1
-					n := atomic.AddInt32(&acks, 1)
-
-					if n == int32(rf.quorum) {
-						rf.commitIndex = logIndex // commit this message
-
-						applyMsg := ApplyMsg{}
-						applyMsg.Command = command
-						applyMsg.CommandIndex = logIndex
-						applyMsg.CommandValid = true
-
-						// apply to state machine
-						rf.applyCh <- applyMsg
-						rf.lastApplied = logIndex
-					}
-
-					rf.mu.Unlock()
-				} else if reply.Term <= rf.currentTerm { // append entry failure
-					rf.mu.Lock()
-					rf.nexIndex[serverIdx]-- // decrease next index
-					rf.mu.Unlock()
-				} else {
-					rf.mu.Lock()
-					rf.revertToFollower(reply.Term)
-					rf.mu.Unlock()
-				}
-				break
-			}
+		go func(serverIdx int) { // let broadcast routine broad cast
+			rf.broadcastLogChan[serverIdx] <- logIndex
+			//log.Printf("%v scheduled to broadcast log entry %v to %v", rf.me, entry, serverIdx)
 		}(i)
 	}
 
-	return index, term, isLeader
+	return logIndex, rf.currentTerm, true
 }
 
 //
@@ -452,6 +421,11 @@ func (rf *Raft) competeForLeader() {
 
 		go func(peer *labrpc.ClientEnd, i int) {
 			req := RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me}
+
+			lastLogEntry := rf.log[len(rf.log)-1]
+			req.LastLogTerm = lastLogEntry.Term // correct
+			req.LastLogIndex = lastLogEntry.Index
+
 			reply := RequestVoteReply{}
 
 			log.Println(rf.me, "sending request vote to", i)
@@ -478,9 +452,9 @@ func (rf *Raft) resetTimeout() {
 
 func (rf *Raft) takeOver() {
 	log.Println(rf.me, "takes over.")
-	rf.mu.Lock()
-	rf.role = 2
-	rf.mu.Unlock()
+
+	atomic.StoreInt32(&rf.role, 2)
+	rf.startBroadcasters()
 
 	for atomic.LoadInt32(&rf.role) == 2 { // as long as I am master
 
@@ -520,6 +494,118 @@ func (rf *Raft) takeOver() {
 	}
 }
 
+func (rf *Raft) startBroadcasters() {
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+
+		timeout := time.Duration(float64(rf.minTimeoutMillis) * 0.5)
+
+		go func(serverIdx int) {
+			log.Printf("%v starting broadcaster to %v\n", rf.me, serverIdx)
+			ch := rf.broadcastLogChan[serverIdx]
+			for atomic.LoadInt32(&rf.role) == 2 { // as long as I am still leader
+				select {
+				case logIndex := <-ch:
+					rf.doBroadCastLogToFollower(serverIdx, logIndex)
+				case <-time.After(time.Millisecond * timeout):
+					// just don't block on <- ch
+				}
+			}
+			log.Printf("%v said wtf!", rf.me)
+		}(i)
+	}
+}
+
+func (rf *Raft) doBroadCastLogToFollower(serverIdx int, logIdx int) {
+
+	if logIdx < rf.nexIndex[serverIdx] || logIdx <= rf.matchIndex[serverIdx] {
+		log.Printf("Log entry %v already broadcased to follower %v\n", logIdx, serverIdx)
+		return
+	}
+
+	if logIdx > rf.nexIndex[serverIdx] {
+		log.Printf("Follower %v has not caught up with entry %v yet!\n", serverIdx, logIdx)
+		return
+	}
+
+	log.Printf("%v do broadcasting entry %v to %v\n", rf.me, logIdx, serverIdx)
+	args := &AppendEntriesArgs{}
+	args.Term = rf.currentTerm
+	args.LeaderId = rf.me
+
+	prevEntry := rf.log[logIdx-1]
+
+	args.PrevLogIndex = prevEntry.Index
+	args.PrevLogTerm = prevEntry.Term
+	args.Entries = []interface{}{rf.log[logIdx]}
+	args.LeaderCommit = rf.commitIndex
+
+	reply := &AppendEntriesReply{}
+
+	for {
+		ok := rf.peers[serverIdx].Call("Raft.AppendEntries", args, reply)
+		log.Printf("%v got broadcasting entry res from %v, res: %v", rf.me, serverIdx, reply)
+		if !ok {
+			time.Sleep(time.Duration(float64(rf.minTimeoutMillis)*0.5) * time.Millisecond)
+			continue // retry
+		}
+
+		if reply.Success {
+			rf.mu.Lock()
+			rf.nexIndex[serverIdx] = logIdx + 1
+
+			if logIdx > rf.commitIndex {
+				n := rf.logAck[logIdx]
+				n += 1
+				rf.logAck[logIdx] = n
+
+				if n == rf.quorum {
+
+					rf.commitIndex = logIdx
+					rf.matchIndex[serverIdx] = logIdx
+					rf.matchIndex[rf.me] = logIdx
+
+					log.Printf("%v committed log entry %v", rf.me, logIdx)
+
+					delete(rf.logAck, logIdx)
+
+					// Apply this message
+					msg := ApplyMsg{}
+
+					entry := rf.log[logIdx]
+					msg.CommandIndex = logIdx
+					msg.CommandValid = true
+					msg.Command = entry.Command
+
+					go func() { rf.applyCh <- msg }() // non blocking
+
+					rf.lastApplied = logIdx
+					log.Printf("%v applied log entry %v", rf.me, logIdx)
+				}
+			} else { // leader already commit this log
+				rf.matchIndex[serverIdx] = logIdx
+			}
+
+			if len(rf.log) > logIdx+1 { // still got more entries to sync
+				go func() { rf.broadcastLogChan[serverIdx] <- logIdx + 1 }() // non-blocking schedule to sync next entry
+			}
+			rf.mu.Unlock()
+		} else { // reply not success
+			rf.mu.Lock()
+			if reply.Term > rf.currentTerm {
+				rf.revertToFollower(reply.Term)
+			} else { // just append entries failure
+				rf.nexIndex[serverIdx]--
+			}
+			rf.mu.Unlock()
+		}
+
+		break
+	}
+}
+
 func (rf *Raft) revertToFollower(term int) {
 	rf.currentTerm = term
 	rf.role = 0
@@ -527,33 +613,21 @@ func (rf *Raft) revertToFollower(term int) {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	log.Println(rf.me, "got append entries from ", args.LeaderId)
+	log.Printf("%v got append entries from %v\n", rf.me, args)
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// Election restriction
-	lastCommitEntry := rf.log[rf.commitIndex].([]interface{})
-	lastCommitEntryTerm := lastCommitEntry[1].(int) // initialized to 0
-	if args.Term < lastCommitEntryTerm {
-		reply.Success = false
-		reply.Term = rf.currentTerm
-		return
-	}
-
-	lastCommitEntryIdx := lastCommitEntry[0].(int) // initialized to 0
-	if args.LeaderCommit < lastCommitEntryIdx {
-		reply.Success = false
-		reply.Term = rf.currentTerm
-		return
-	}
-
 	if rf.currentTerm < args.Term {
+
+		// heart beat logic
 		rf.votedFor = -1 // Didn't vote i this term
 		rf.revertToFollower(args.Term)
-
-		// TODO: implement follower append entries entries logic
 		reply.Term = rf.currentTerm
 		reply.Success = true
+
+		// real append entries logic
+		rf.tryAppendEntries(args, reply)
 		return
 	}
 
@@ -561,16 +635,64 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if rf.me == args.LeaderId {
 			// this should never happen
 		} else { // term equal, and heart beat send not from self
+			// heart beat logic
 			rf.revertToFollower(args.Term)
-			// TODO: implement follower append entries entries logic
 			reply.Success = true
 			reply.Term = rf.currentTerm
+
+			// real append entries logic
+			rf.tryAppendEntries(args, reply)
 		}
+		return
 	}
 
 	// rf.currentTerm > args.term
 	reply.Term = rf.currentTerm
 	reply.Success = false
+}
+
+func (rf *Raft) tryAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+
+	if len(args.Entries) > 0 {
+		if rf.log[len(rf.log)-1].Index < args.PrevLogIndex { // ain't catchup yet
+			// TODO: wrong logic
+			log.Printf("%v not caught up with append entry req: %v\n", rf.me, args)
+			reply.Success = false
+			return
+		}
+
+		if rf.log[len(rf.log)-1].Index > args.PrevLogIndex { // this log already appended
+			log.Printf("%v already processed duplicated entry req: %v\n", rf.me, args)
+			reply.Success = true
+			return
+		}
+
+		// only append when rf.log[len(rf.log)-1].Index == args.PrevLogIndex
+
+		entry := args.Entries[0].(LogEntry)
+		log.Printf("Folower %v append %v to its logs", rf.me, entry)
+		rf.log = append(rf.log, entry)
+	}
+
+	for rf.commitIndex <= args.LeaderCommit {
+		log.Printf("Folower %v commit entries with index %v", rf.me, rf.commitIndex)
+		if rf.commitIndex > 0 {
+			applyMsg := ApplyMsg{}
+
+			commitEntry := rf.log[rf.commitIndex]
+			applyMsg.Command = commitEntry.Command
+			applyMsg.CommandIndex = commitEntry.Index
+			applyMsg.CommandValid = true
+
+			// apply to state machine
+			go func() { rf.applyCh <- applyMsg }()
+		}
+
+		rf.lastApplied = rf.commitIndex
+		rf.commitIndex += 1
+		log.Printf("Follower %v commited and applied to %v", rf.me, rf.lastApplied)
+	}
+
 }
 
 //
@@ -584,8 +706,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 //
+
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
+	labgob.Register(LogEntry{})
 
 	log.Default().Println("Making raft, me: ", me)
 
@@ -607,8 +731,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.currentTerm = 0
 
-	rf.log = make([]interface{}, 0, 256)
-	rf.log = append(rf.log, []interface{}{0, 0, nil}) // put a dummy head
+	rf.log = make([]LogEntry, 0, 256)
+	rf.log = append(rf.log, LogEntry{0, 0, nil}) // put a dummy head
 
 	rf.commitIndex = 0
 	rf.lastApplied = 0
@@ -619,6 +743,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// log replication related code goes here
 	rf.applyCh = applyCh
 
+	// initializing broadcasting channel
+	rf.broadcastLogChan = make([]chan int, 0, 3)
+	for i := 0; i < len(peers); i++ {
+		rf.broadcastLogChan = append(rf.broadcastLogChan, make(chan int, 4))
+	}
+
+	rf.logAck = make(map[int]int)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
